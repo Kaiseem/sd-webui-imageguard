@@ -10,7 +10,7 @@ def zero_gradients(x):
             x.grad.zero_()
 
 def preprocess_img(pil_img, device_name):
-    pil_img=torch.from_numpy(np.array(pil_img).transpose((2,0,1))).unsqueeze(0).to(device_name).half()
+    pil_img=torch.from_numpy(np.array(pil_img).transpose((2,0,1))).unsqueeze(0).to(device_name)
     pil_img= pil_img/127.5-1
     return pil_img
 

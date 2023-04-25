@@ -9,6 +9,7 @@ from modules import shared
 
 from modules import sd_models
 
+from torch.cuda.amp import autocast as autocast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,17 +28,17 @@ else:
         except ValueError:
             print('--device-id is not a integer')
 
+
 class Attacker:
-    def __init__(self, model_name, image) -> None:
-        print('DEBUG:',device_name)
+    def __init__(self, model_name, image,text) -> None:
         self.model_name = model_name
         self.load_model()
         self.image = preprocess_img(image, device_name).to(device_name)
+        self.text=text
 
     def load_model(self):
         model_info = sd_models.checkpoints_list[self.model_name]
         self.model = sd_models.load_model(model_info)
-        self.model.to(device_name)
 
     def attack(self):
         raise NotImplementedError()
@@ -47,79 +48,75 @@ class PGDAttacter(Attacker):
         self,
         model,
         image,
+        text,
         tgt_image,
         atksteps,
         epsilon,
         stepsize,
-        pgd_params
     ) -> None:
-        super().__init__(model,image)
+        super().__init__(model,image,text)
         self.tgt_attack=True if tgt_image is not None else False
         self.tgt_image = tgt_image
         self.atksteps = atksteps
         self.epsilon = epsilon
-        self.stepsize = stepsize
-        self.atk_latent = True if "attack latent" in pgd_params else False
-        self.start_noise = True if "start noise" in pgd_params else False
-        self.vae_sample = True if "vae sample" in pgd_params else False
+        self.step_size = stepsize
+        self.step_sign = 1
 
-    def attack(self):
+    def attack(self,pbar,  return_no_norm_img=False):
         if self.tgt_attack:
             self.tgt_image = preprocess_img(self.tgt_image, device_name)
             self.tgt_image = F.interpolate(self.tgt_image, size=self.image.size()[2:], mode='bilinear')
 
-        loss_fn = nn.MSELoss()
-        epsilon = self.epsilon / 255 * 2
-        step_size = self.stepsize / 255 * 2
-        x = Variable(self.image.detach()) if not self.start_noise else Variable(
-            self.image.detach() + torch.zeros_like(self.image).uniform_(-epsilon, epsilon))
-
-        if not self.tgt_attack:
-            step_sign = 1
-            if self.atk_latent:
-                with torch.no_grad():
-                    label = self.model.first_stage_model.encode(self.image)
-            else:
-                label = self.image.detach()
-        else:
-            step_sign = -1
-            if self.atk_latent:
-                with torch.no_grad():
-                    label = self.model.first_stage_model.encode(self.tgt_image)
-            else:
-                label = self.tgt_image.detach()
-
+        x = Variable(self.image.detach()).half()
         for i in range(self.atksteps):
-            print('step ' + str(i))
             x.requires_grad_()
             zero_gradients(x)
             if x.grad is not None:
                 x.grad.data.fill(0)
-            if self.vae_sample:
-                z = self.model.first_stage_model.encode(x).sample().half()
-            else:
-                z = self.model.first_stage_model.encode(x).mode().half()
+            with autocast():
+                latents = self.model.first_stage_model.encode(x).sample() * self.model.scale_factor  # N=4, C, 64, 64
 
-            if self.atk_latent:
-                loss = loss_fn(z, label.mode().half())
-            else:
-                out = self.model.first_stage_model.decode(z)
+                latents=latents.to(torch.float32)
 
-                loss = loss_fn(out, label)
+                noise = torch.randn_like(latents)
+                bsz = latents.shape[0]
+
+                timesteps = torch.randint(
+                    0,
+                    self.model.num_timesteps,
+                    (bsz,),
+                    device=latents.device,
+                )
+                timesteps = timesteps.long()
+                noisy_latents = self.model.q_sample(x_start=latents, t=timesteps, noise=noise)
+                encoder_hidden_states = self.model.cond_stage_model([self.text])
+                model_pred = self.model.apply_model(noisy_latents, timesteps, encoder_hidden_states)
+
+            if self.model.parameterization == "eps":
+                target = noise
+            elif self.model.parameterization == "x0":
+                target = latents
+            elif self.model.parameterization == "v":
+                target = self.model.get_v(latents, noise, timesteps)
+            else:
+                raise NotImplementedError(f"Paramterization {self.model.parameterization} not yet supported")
 
             self.model.zero_grad()
+            with autocast():
+                loss = F.mse_loss(model_pred, target, reduction="mean")
             loss.backward()
 
-            x_adv = x.data + step_sign * step_size * torch.sign(x.grad.data)
-            x_adv = torch.min(torch.max(x_adv, self.image - epsilon), self.image + epsilon)
+            x_adv = x.data + self.step_sign * self.step_size * torch.sign(x.grad.data)
+            x_adv = torch.min(torch.max(x_adv, self.image - self.epsilon), self.image + self.epsilon)
             x_adv = torch.clamp(x_adv, -1, 1)
             x = Variable(x_adv)
+            pbar.update(1)
+        if return_no_norm_img:
+            attacked_image=x.detach()
+        else:
+            attacked_image = Image.fromarray(to_rgb(x.detach()))
+        del x, loss, x_adv, self.model
+        return attacked_image
 
-        with torch.no_grad():
-            z = self.model.first_stage_model.encode(x).mode().half()
-            recon_x = self.model.first_stage_model.decode(z)
-
-        attacked_image = Image.fromarray(to_rgb(x.detach()))
-        reconstructed_image = Image.fromarray(to_rgb(recon_x))
-        del x, loss, x_adv, label
-        return attacked_image, reconstructed_image
+    def convert_to_rgb(self,x):
+        return Image.fromarray(to_rgb(x))
