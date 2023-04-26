@@ -62,7 +62,7 @@ class PGDAttacter(Attacker):
         self.step_size = stepsize
         self.step_sign = 1
 
-    def attack(self,pbar,  return_no_norm_img=False):
+    def attack(self, pbar, return_no_norm_img=False):
         if self.tgt_attack:
             self.tgt_image = preprocess_img(self.tgt_image, device_name)
             self.tgt_image = F.interpolate(self.tgt_image, size=self.image.size()[2:], mode='bilinear')
